@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
+from streamlit.components.v1 import html
 
 st.set_page_config(page_title="AI错词复习系统", layout="centered")
 st.title("📘 AI错词系统（在线版）")
@@ -46,8 +47,11 @@ INTERVALS = [1, 2, 4, 7, 15, 30]
 if "review_words" not in st.session_state:
     st.session_state.review_words = []
     st.session_state.review_index = 0
-    st.session_state.show_answer = False
     st.session_state.review_initialized = False
+
+# 用于记录刚刚点击了不认识的单词，用作弹窗触发
+if "just_forgot_word" not in st.session_state:
+    st.session_state.just_forgot_word = None
 
 # 自动获取今日需要复习的词
 def load_review_words():
@@ -61,7 +65,6 @@ def load_review_words():
     """, (today_str,))
     st.session_state.review_words = cursor.fetchall()
     st.session_state.review_index = 0
-    st.session_state.show_answer = False
     st.session_state.review_initialized = True
 
 if not st.session_state.review_initialized:
@@ -120,6 +123,22 @@ with tab2:
         load_review_words()
         st.rerun()
 
+    # 处理“不认识”点击后的自动弹窗跳转
+    if st.session_state.just_forgot_word:
+        forgot_w = st.session_state.just_forgot_word
+        st.session_state.just_forgot_word = None # 立即清空，防止循环弹窗
+        
+        # 1. 注入轻量 JavaScript 脚本自动在新标签页打开有道词典
+        html(f"""
+            <script type="text/javascript">
+                window.open('https://dict.youdao.com/w/{forgot_w}', '_blank');
+            </script>
+        """, height=0)
+        
+        # 2. 界面友好提示
+        st.toast(f"已为您跳转有道词典查询 '{forgot_w}'")
+        st.markdown(f"ℹ️ 已自动尝试打开词典。若弹窗被浏览器拦截，请手动点击：[👉 查看 '{forgot_w}' 的有道释义](https://dict.youdao.com/w/{forgot_w})")
+
     review_list = st.session_state.review_words
     current_idx = st.session_state.review_index
 
@@ -134,58 +153,50 @@ with tab2:
         st.info(f"👉 **单词**:  `{word}`")
         st.write(f"当前记忆阶段: **Stage {stage}** | 累计错误次数: **{err_count}**")
 
-        # 闪卡翻页交互
-        if not st.session_state.show_answer:
-            if st.button("👁️ 唤起回忆 / 查看释义"):
-                st.session_state.show_answer = True
+        # 【核心修改点】：直接显示“认识”和“不认识”按钮，省去中间确认环节
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ 认识 (进入下一阶段)", use_container_width=True):
+                # 计算下次复习时间（升级记忆阶段）
+                next_stage = stage + 1
+                status = 'learning'
+                if next_stage >= len(INTERVALS):
+                    status = 'mastered'
+                    days = 365  # 已掌握的词放进长期归档，365天后再看
+                else:
+                    days = INTERVALS[next_stage]
+                
+                next_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+                
+                cursor.execute("""
+                    UPDATE words 
+                    SET stage = ?, next_review = ?, status = ?, last_seen = ?
+                    WHERE word = ?
+                """, (next_stage, next_date, status, datetime.now().strftime("%Y-%m-%d"), word))
+                conn.commit()
+                
+                st.session_state.review_index += 1
                 st.rerun()
-        else:
-            # 引导用户在脑海中回忆，并提供外部查词链接
-            st.success("📝 请回忆此单词的释义。")
-            st.markdown(f"[🔍 在有道词典中查看 '{word}'](https://dict.youdao.com/w/{word})")
-            
-            # 反馈操作
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("✅ 认识 (进入下一阶段)"):
-                    # 计算下次复习时间
-                    next_stage = stage + 1
-                    status = 'learning'
-                    if next_stage >= len(INTERVALS):
-                        status = 'mastered'
-                        days = 365  # 已掌握的词放进长期归档，365天后再看
-                    else:
-                        days = INTERVALS[next_stage]
-                    
-                    next_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-                    
-                    cursor.execute("""
-                        UPDATE words 
-                        SET stage = ?, next_review = ?, status = ?, last_seen = ?
-                        WHERE word = ?
-                    """, (next_stage, next_date, status, datetime.now().strftime("%Y-%m-%d"), word))
-                    conn.commit()
-                    
-                    st.session_state.review_index += 1
-                    st.session_state.show_answer = False
-                    st.rerun()
-                    
-            with col2:
-                if st.button("❌ 不认识 (重置阶段)"):
-                    # 忘记了，重置阶段到 0，安排在明天再次复习
-                    next_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-                    cursor.execute("""
-                        UPDATE words 
-                        SET stage = 0, next_review = ?, last_seen = ?
-                        WHERE word = ?
-                    """, (next_date, datetime.now().strftime("%Y-%m-%d"), word))
-                    conn.commit()
-                    
-                    st.session_state.review_index += 1
-                    st.session_state.show_answer = False
-                    st.rerun()
+                
+        with col2:
+            if st.button("❌ 不认识 (跳转有道并重置)", use_container_width=True):
+                # 1. 暂存当前错词，用于页面重载时触发 JS 弹窗
+                st.session_state.just_forgot_word = word
+                
+                # 2. 忘记了，重置该词记忆阶段到 0，安排在明天重新复习
+                next_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+                cursor.execute("""
+                    UPDATE words 
+                    SET stage = 0, next_review = ?, last_seen = ?
+                    WHERE word = ?
+                """, (next_date, datetime.now().strftime("%Y-%m-%d"), word))
+                conn.commit()
+                
+                # 3. 推进至下一个单词
+                st.session_state.review_index += 1
+                st.rerun()
     else:
-        st.success("🎉 太棒了！今天需要复习的单词已经全部完成，或者目前暂无需要复习的词。")
+        st.success("🎉 今日需要复习的单词已经全部完成，或者目前暂无需要复习的词。")
 
 
 # ==================== Tab 3: 错词库管理 ====================
